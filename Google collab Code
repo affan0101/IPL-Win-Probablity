@@ -1,0 +1,156 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+import pickle
+import joblib
+
+# Constants
+TEAM_MAP = {
+    'Chennai Super Kings': 'Chennai Super Kings',
+    'Delhi Capitals': 'Delhi Capitals',
+    'Kolkata Knight Riders': 'Kolkata Knight Riders',
+    'Mumbai Indians': 'Mumbai Indians',
+    'Punjab Kings': 'Punjab Kings',
+    'Rajasthan Royals': 'Rajasthan Royals',
+    'Royal Challengers Bangalore': 'Royal Challengers Bangalore',
+    'Sunrisers Hyderabad': 'Sunrisers Hyderabad',
+    'Gujarat Titans': 'Gujarat Titans',
+    'Lucknow Super Giants': 'Lucknow Super Giants'
+}
+
+def load_and_preprocess_data():
+    """Load and preprocess match data"""
+    matches = pd.read_csv('matches.csv')
+    deliveries = pd.read_csv('deliveries.csv')
+    top_batsmen_df = pd.read_csv('final_batting_2023.csv')
+
+    # Normalize team names
+    for col in ['team1', 'team2', 'winner']:
+        matches[col] = matches[col].map(TEAM_MAP)
+    for col in ['batting_team', 'bowling_team']:
+        deliveries[col] = deliveries[col].map(TEAM_MAP)
+
+    # Filter matches
+    if 'dl_applied' in matches.columns:
+        matches = matches[matches['dl_applied'] == 0]
+
+    return matches, deliveries, top_batsmen_df
+
+def create_features(matches, deliveries, top_batsmen_df):
+    """Create advanced features for modeling"""
+    # First innings total
+    first_innings = deliveries[deliveries['inning'] == 1]
+    first_innings = first_innings.groupby('match_id')['total_runs'].sum().reset_index()
+    first_innings.rename(columns={'total_runs': 'target'}, inplace=True)
+
+    # Process second innings with advanced features
+    second_innings = deliveries[deliveries['inning'] == 2]
+    second_innings = second_innings.merge(matches[['id', 'team1', 'team2', 'winner', 'venue']],
+                                         left_on='match_id', right_on='id')
+    second_innings = second_innings.merge(first_innings, on='match_id')
+
+    # Basic match progression features
+    second_innings['current_score'] = second_innings.groupby('match_id')['total_runs'].cumsum()
+    second_innings['wickets'] = second_innings['player_dismissed'].notnull().astype(int)
+    second_innings['wickets'] = second_innings.groupby('match_id')['wickets'].cumsum()
+    second_innings['balls'] = second_innings.groupby('match_id').cumcount() + 1
+
+    # Advanced cricket metrics
+    second_innings['runs_left'] = second_innings['target'] - second_innings['current_score']
+    second_innings['balls_left'] = 120 - second_innings['balls']
+    second_innings['crr'] = second_innings['current_score'] / (second_innings['balls'] / 6)
+    second_innings['rrr'] = second_innings['runs_left'] / (second_innings['balls_left'] / 6)
+    second_innings['wickets_in_hand'] = 10 - second_innings['wickets']
+
+    # Advanced derived features
+    second_innings['pressure_index'] = second_innings['rrr'] / second_innings['crr'].replace(0, np.nan)
+    second_innings['momentum_shift_index'] = second_innings['total_runs'] - second_innings['crr'] * (second_innings['balls'] / 6)
+    second_innings['dot_ball_percent'] = second_innings.groupby('match_id')['total_runs'].transform(lambda x: (x == 0).cumsum()) / second_innings['balls']
+
+    # Player-specific feature
+    top_batsmen = set(top_batsmen_df['Player'].unique())
+    second_innings['top_batsman_playing'] = second_innings['batter'].apply(lambda x: 1 if x in top_batsmen else 0)
+    second_innings['top_batsman_playing'] = second_innings.groupby('match_id')['top_batsman_playing'].transform('max')
+
+    # Determine bowling team and result
+    second_innings['bowling_team'] = np.where(
+        second_innings['batting_team'] == second_innings['team1'],
+        second_innings['team2'], second_innings['team1']
+    )
+    second_innings['result'] = np.where(second_innings['batting_team'] == second_innings['winner'], 1, 0)
+
+    return second_innings
+
+def build_model_pipeline():
+    """Build the machine learning pipeline"""
+    categorical_features = ['batting_team', 'bowling_team', 'venue']
+    preprocessor = ColumnTransformer([
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    ], remainder='passthrough')
+
+    return Pipeline([
+        ('preprocessor', preprocessor),
+        ('model', RandomForestClassifier(
+            n_estimators=200,
+            max_depth=12,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=42,
+            class_weight='balanced',
+            n_jobs=-1
+        ))
+    ])
+
+def evaluate_model(model, X_test, y_test):
+    """Evaluate model performance"""
+    y_pred = model.predict(X_test)
+    return {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'precision': precision_score(y_test, y_pred),
+        'recall': recall_score(y_test, y_pred)
+    }
+
+def main():
+    # Load and preprocess data
+    matches, deliveries, top_batsmen_df = load_and_preprocess_data()
+    second_innings = create_features(matches, deliveries, top_batsmen_df)
+
+    # Prepare final dataset
+    features = [
+        'batting_team', 'bowling_team', 'venue', 'current_score', 'wickets',
+        'balls_left', 'runs_left', 'crr', 'rrr', 'pressure_index',
+        'momentum_shift_index', 'dot_ball_percent', 'wickets_in_hand',
+        'top_batsman_playing', 'result'
+    ]
+    data = second_innings[features].dropna()
+    data = data[(data['balls_left'] > 0) & (data['runs_left'] > 0)]
+
+    X = data.drop('result', axis=1)
+    y = data['result']
+
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Build and train model
+    pipe = build_model_pipeline()
+    pipe.fit(X_train, y_train)
+
+
+    # Evaluate model
+    metrics = evaluate_model(pipe, X_test, y_test)
+    print(f"Model Evaluation:\nAccuracy: {metrics['accuracy']:.2f}\n"
+          f"Precision: {metrics['precision']:.2f}\nRecall: {metrics['recall']:.2f}")
+
+    # Save model
+    joblib.dump(pipe, 'advanced_pipe.pkl')
+    print("✅ Advanced model trained and saved as 'advanced_pipe.pkl'")
+
+if __name__ == "__main__":
+    main()
